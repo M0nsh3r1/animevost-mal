@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Animevost → MyAnimeList
 // @namespace    animevost-mal
-// @version      2.1
+// @version      2.2
 // @description  Находит аниме на MAL, отмечает серии прямо на странице, темы оформления для animevost
 // @match        https://animevost.org/*
 // @run-at       document-start
@@ -50,6 +50,12 @@
       v: { bg: '#313338', bg2: '#2b2d31', bg3: '#1e1f22', bd: '#3f4147', tx: '#dbdee1', tx2: '#949ba4', lk: '#00a8fc', ac: '#5865f2',
         h1: '#5865f2', h2: '#4752c4', htx: '#fff', b1: '#5865f2', b2: '#4752c4', bb: '#3c45a5', btx: '#fff',
         gh: '#383a40', card: '#35373c', best: '#3b4270', 'in': '#1e1f22', ok: '#23a55a', pbg: '#2b2d31' },
+    },
+    discordg: {
+      name: 'Discord (серая)',
+      v: { bg: '#2b2d31', bg2: '#313338', bg3: '#232428', bd: '#3f4147', tx: '#dbdee1', tx2: '#949ba4', lk: '#00a8fc', ac: '#5865f2',
+        h1: '#3a3c42', h2: '#2e3035', htx: '#f2f3f5', b1: '#4e5058', b2: '#43454c', bb: '#5a5d66', btx: '#fff',
+        gh: '#383a40', card: '#35373c', best: '#3a3d4f', 'in': '#1e1f22', ok: '#23a55a', pbg: '#313338' },
     },
   };
 
@@ -119,6 +125,11 @@
     #comment button{background:var(--m-ac)!important;color:#fff!important;border-color:var(--m-bd)!important}
     #futer,#fraind,#copyr,#copyrText{background:var(--m-bg2)!important;color:var(--m-tx2)!important;border-color:var(--m-bd)!important}
     #copyr a{color:var(--m-lk)!important}
+    [style*="feb94f"],.imgOngoing,.interDub{border-color:var(--m-bd)!important}
+    .interDub *,.shortstoryFuter,.shortstoryFuter *{text-shadow:none!important}
+    .shortstoryFuter strong{color:var(--m-tx2)!important}
+    #nexttime{background:var(--m-bg3)!important;color:var(--m-tx)!important;border-color:var(--m-bd)!important;text-shadow:none!important}
+    #rulesComment a,#newComment p{color:var(--m-tx2)!important;border-color:var(--m-bd)!important}
   `;
 
   const themeStyle = document.createElement('style');
@@ -534,11 +545,26 @@
       const msg = h('span', { class: 'mal-msg' });
       const hint = h('div', { class: 'mal-msg' });
       const markBtn = h('button', { class: 'mal-btn big' });
+      const known = h('input', { type: 'number', min: '1', placeholder: '№' });
+      const calcBtn = h('button', {
+        class: 'mal-btn ghost', text: 'Посчитать сдвиг',
+        onclick: () => {
+          const n = currentEp();
+          const k = parseInt(known.value, 10);
+          if (n == null || !k) { hint.className = 'mal-msg mal-err'; hint.textContent = 'Выберите серию в плеере и введите её номер на MAL.'; return; }
+          offset.value = n - k;
+          offset.dispatchEvent(new Event('change'));
+          hint.className = 'mal-msg mal-ok';
+          hint.textContent = 'Сдвиг: ' + (n - k) + ' (серия ' + n + ' на animevost = серия ' + k + ' на MAL)';
+        },
+      });
       const det = h('details', null,
         h('summary', { text: 'Нумерация не совпадает с MAL?' }),
         h('div', { class: 'mal-row' },
           'Сдвиг:', offset,
-          h('span', { class: 'mal-meta', text: 'Нужен, если на animevost серии идут подряд (13–24), а на MAL это 2-й part (1–12): тогда 12.' })),
+          h('span', { class: 'mal-meta', text: 'Сколько серий на animevost идёт ДО первой серии этого сезона на MAL. Если у них сезон начинается с 13-й серии — сдвиг 12.' })),
+        h('div', { class: 'mal-row' },
+          'Или: серия в плеере сейчас — это серия №', known, 'на MAL', calcBtn),
         hint);
 
       const say = (t, ok) => { msg.className = 'mal-msg ' + (ok ? 'mal-ok' : 'mal-err'); msg.textContent = t; };
