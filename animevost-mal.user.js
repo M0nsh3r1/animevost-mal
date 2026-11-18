@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Animevost → MyAnimeList
 // @namespace    animevost-mal
-// @version      1.2
-// @description  Находит аниме на MAL по названию с animevost, показывает карточки-кандидаты и даёт отмечать серии прямо на странице
+// @version      2.0
+// @description  Находит аниме на MAL по названию с animevost и даёт отмечать серии прямо на странице
 // @match        https://animevost.org/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
   /* ---------- утилиты ---------- */
   const gm = (opts) => new Promise((resolve, reject) => {
     GM_xmlhttpRequest(Object.assign({
-      timeout: 20000,
+      timeout: 15000,
       onload: resolve,
       onerror: reject,
       ontimeout: () => reject(new Error('timeout')),
@@ -203,17 +203,17 @@
   const info = {
     year: parseInt(field('Год выхода'), 10) || null,
     type: field('Тип'),
-    eps: parseInt(field('Количество серий'), 10) || null,
   };
 
+  // типы MAL в виде media_type API (в нижнем регистре)
   const TYPE_MAP = {
-    'ТВ': ['TV'],
-    'ТВ-спэшл': ['TV Special', 'Special'],
-    'OVA': ['OVA'],
-    'ONA': ['ONA'],
-    'Полнометражный фильм': ['Movie'],
-    'Короткометражный фильм': ['Movie', 'Special', 'ONA'],
-    'Дунхуа': ['ONA', 'TV'],
+    'ТВ': ['tv'],
+    'ТВ-спэшл': ['tv_special', 'special'],
+    'OVA': ['ova'],
+    'ONA': ['ona'],
+    'Полнометражный фильм': ['movie'],
+    'Короткометражный фильм': ['movie', 'special', 'ona'],
+    'Дунхуа': ['ona', 'tv'],
   };
 
   function buildQueries() {
@@ -221,73 +221,116 @@
     const parts = clean(h1.textContent).split(/\s+\/\s+/).map((s) => s.trim()).filter(Boolean);
     const latin = parts.filter((p) => /[A-Za-z]/.test(p) && !/[А-Яа-яЁё]/.test(p));
     const q = [];
-    const add = (s) => { s = (s || '').replace(/\s+/g, ' ').trim(); if (s.length >= 3 && !q.includes(s)) q.push(s); };
+    const add = (s) => {
+      s = (s || '').replace(/\s+/g, ' ').trim().slice(0, 64).trim();
+      if (s.length >= 3 && !q.includes(s)) q.push(s);
+    };
 
     const main = latin.length ? latin[latin.length - 1] : '';
     add(main);
-    add(main.replace(/\(\d{4}\)/g, ''));                 // Ranma ½ (2024) 3rd Season -> без года
+    add(main.replace(/\(\d{4}\)/g, ''));
     if (h4) {
       const t = h4.textContent.replace(/\s+/g, ' ').trim();
       if (/[A-Za-z]/.test(t)) {
-        add(t.split(/\.\s/)[0]);                           // первое предложение (до подзаголовка)
-        add(t.split(' ').slice(0, 7).join(' '));           // первые слова
+        add(t.split(/\.\s/)[0]);                       // романдзи до подзаголовка
+        add(t.split(' ').slice(0, 7).join(' '));
       }
     }
-    add(main.split(' ').slice(0, 6).join(' '));
+    add(main.split(':')[0]);                            // «Nia Liston: The Merciless Maiden» → «Nia Liston»
     if (!q.length) add(parts[parts.length - 1]);
-    return q;
+    return q.slice(0, 4);
   }
 
   const queries = buildQueries();
   const searchUrl = () => 'https://myanimelist.net/anime.php?cat=anime&q=' + encodeURIComponent(queries[0] || h1.textContent);
 
-  /* ---------- Jikan ---------- */
-  async function jikanGet(url) {
+  /* ---------- поиск кандидатов ---------- */
+  const normType = (t) => (t || '').toLowerCase().replace(/\s+/g, '_');
+  const yearOf = (d) => (d ? parseInt(d, 10) || null : null);
+
+  async function searchMal(q) {
+    const d = await malApi('GET', '/anime?' + form({
+      q, limit: 6,
+      fields: 'media_type,start_season,start_date,num_episodes,mean,alternative_titles',
+    }));
+    return (d.data || []).map(({ node: n }) => ({
+      id: n.id,
+      title: n.title,
+      eng: n.alternative_titles && n.alternative_titles.en,
+      type: n.media_type,
+      year: (n.start_season && n.start_season.year) || yearOf(n.start_date),
+      eps: n.num_episodes,
+      score: n.mean,
+    }));
+  }
+
+  async function searchJikan(q) {
     for (let i = 0; i < 2; i++) {
-      const r = await gm({ method: 'GET', url, headers: { Accept: 'application/json' } });
-      if (r.status === 429) { await sleep(1300); continue; }
-      if (r.status !== 200) return null;
-      return JSON.parse(r.responseText).data;
+      const r = await gm({ method: 'GET', url: JIKAN + '?' + form({ q, limit: 6 }), headers: { Accept: 'application/json' } });
+      if (r.status === 429) { await sleep(1200); continue; }
+      if (r.status !== 200) return [];
+      return (JSON.parse(r.responseText).data || []).map((a) => ({
+        id: a.mal_id,
+        title: a.title,
+        eng: a.title_english,
+        type: normType(a.type),
+        year: a.year || (a.aired && a.aired.prop && a.aired.prop.from && a.aired.prop.from.year) || null,
+        eps: a.episodes,
+        score: a.score,
+      }));
     }
-    return null;
+    return [];
   }
 
   async function findCandidates() {
-    const seen = new Map();
-    for (const q of queries) {
-      const res = (await jikanGet(JIKAN + '?' + form({ q, limit: 6 }))) || [];
-      res.forEach((a) => { if (!seen.has(a.mal_id)) seen.set(a.mal_id, a); });
-      if (seen.size >= 5) break;
-      await sleep(450);
+    let lists = [];
+    if (GM_getValue('mal_tok')) {
+      lists = await Promise.all(queries.map((q) => searchMal(q).catch(() => [])));
     }
+    if (!lists.some((l) => l.length)) {
+      lists = [];
+      for (const q of queries.slice(0, 2)) {
+        lists.push(await searchJikan(q).catch(() => []));
+        await sleep(350);
+      }
+    }
+    const seen = new Map();
+    lists.forEach((l) => l.forEach((a) => { if (!seen.has(a.id)) seen.set(a.id, a); }));
     return [...seen.values()];
   }
 
   function scoreOf(a) {
     let s = 0;
-    const y = a.year || (a.aired && a.aired.prop && a.aired.prop.from && a.aired.prop.from.year);
-    if (info.year && y === info.year) s += 2;
-    else if (info.year && y && Math.abs(y - info.year) === 1) s += 0.5;
+    if (info.year && a.year === info.year) s += 2;
+    else if (info.year && a.year && Math.abs(a.year - info.year) === 1) s += 0.5;
     if ((TYPE_MAP[info.type] || []).includes(a.type)) s += 1;
     return s;
   }
 
   /* ---------- стили и панель ---------- */
   document.head.append(h('style', { text: `
-    #mal-panel{background:#fff7ea;border:1px solid #feb94f;border-radius:6px;margin:10px 0;padding:10px 12px;font:13px/1.4 Arial,sans-serif;color:#5a3a00}
-    #mal-panel a{color:#c47504}
-    #mal-panel .mal-head{display:flex;justify-content:space-between;align-items:center;font-weight:bold;font-size:14px;margin-bottom:6px}
-    #mal-panel .mal-btn{background:#ffb84d;border:0;color:#fff;font-weight:bold;padding:4px 10px;border-radius:4px;cursor:pointer}
-    #mal-panel .mal-btn:disabled{opacity:.5;cursor:default}
-    #mal-panel .mal-btn.ghost{background:#eee;color:#555}
-    #mal-panel .mal-card{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 8px;margin:3px 0;border:1px solid #f2d3a0;border-radius:4px;background:#fff}
-    #mal-panel .mal-card.best{border-color:#3a9a3a;background:#f2fff2}
-    #mal-panel .mal-meta{color:#8a6a30;font-size:12px}
-    #mal-panel .mal-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
-    #mal-panel input[type=number],#mal-panel input[type=text],#mal-panel select{padding:2px 4px;border:1px solid #d9b26a;border-radius:3px}
-    #mal-panel input[type=number]{width:54px}
-    #mal-panel .mal-msg{min-height:16px;font-size:12px}
-    #mal-panel .mal-ok{color:#2a7a2a}#mal-panel .mal-err{color:#c02020}
+    iframe[src*="html5banner"]{display:none!important}
+    #mal-panel{margin:10px 0;border:1px solid #f0b050;border-radius:6px;overflow:hidden;background:#fff3de;color:#6b4300;font:12px/1.35 Arial,sans-serif;text-align:left}
+    #mal-panel *{box-sizing:border-box}
+    #mal-panel .mal-head{display:flex;justify-content:space-between;align-items:center;padding:4px 10px;background:linear-gradient(#ffc969,#f8a931);color:#fff;font-weight:bold;font-size:13px;text-shadow:0 1px 0 rgba(120,70,0,.45)}
+    #mal-panel .mal-head a{color:#fff;text-decoration:none;border-bottom:1px dotted #fff;font-weight:normal;font-size:12px}
+    #mal-panel .mal-body{padding:8px 10px}
+    #mal-panel a{color:#b86d00}
+    #mal-panel .mal-row{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin:5px 0}
+    #mal-panel .mal-btn{background:linear-gradient(#ffdc9b,#fbb94f);border:1px solid #e09a2e;color:#7a4600;font-weight:bold;font-size:12px;padding:3px 9px;border-radius:4px;cursor:pointer;text-shadow:0 1px 0 #ffeccb}
+    #mal-panel .mal-btn:hover{filter:brightness(1.05)}
+    #mal-panel .mal-btn:disabled{opacity:.55;cursor:default}
+    #mal-panel .mal-btn.big{font-size:13px;padding:5px 14px}
+    #mal-panel .mal-btn.ghost{background:#fbe8c8;border-color:#e8c68e;color:#8a5a10;font-weight:normal;text-shadow:none}
+    #mal-panel .mal-card{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 8px;margin:4px 0;border:1px solid #f0cd94;border-radius:4px;background:#fff9ee}
+    #mal-panel .mal-card.best{border-color:#e2a03a;background:#fff0cf;box-shadow:inset 3px 0 0 #f0a020}
+    #mal-panel .mal-meta{color:#98702c;font-size:11px}
+    #mal-panel input[type=number],#mal-panel input[type=text],#mal-panel select{padding:2px 4px;border:1px solid #e0b567;border-radius:3px;background:#fffdf8;color:#5a3a00;font-size:12px}
+    #mal-panel input[type=number]{width:50px}
+    #mal-panel .mal-msg{font-size:12px}
+    #mal-panel .mal-ok{color:#2f7d2f}#mal-panel .mal-err{color:#c02020}
+    #mal-panel details{margin-top:4px;color:#98702c}
+    #mal-panel summary{cursor:pointer;font-size:11px}
   ` }));
 
   const panel = h('div', { id: 'mal-panel' });
@@ -297,17 +340,22 @@
     h('div', { class: 'mal-head' },
       h('span', { text: 'MyAnimeList' }),
       h('a', { href: searchUrl(), target: '_blank', rel: 'noopener', text: 'Поиск на MAL ↗' })),
-    body, track);
-  (document.querySelector('.staticInfo') || h1).after(panel);
+    h('div', { class: 'mal-body' }, body, track));
+
+  // вместо рекламного баннера (если он есть) — иначе под шапкой тайтла
+  const ad = document.querySelector('iframe[src*="html5banner"], iframe[src*="loliland"]');
+  if (ad) (ad.closest('center') || ad).replaceWith(panel);
+  else (document.querySelector('.staticInfo') || h1).after(panel);
 
   /* ---------- выбор тайтла ---------- */
   const mapKey = 'map:' + postId;
   const offKey = 'off:' + postId;
+  const candKey = 'cand:' + postId;
 
   function choose(id) { GM_setValue(mapKey, id); render(); }
 
   function pasteRow() {
-    const inp = h('input', { type: 'text', placeholder: 'ссылка на MAL, если не нашлось', size: '34' });
+    const inp = h('input', { type: 'text', placeholder: 'ссылка на страницу MAL', size: '30' });
     return h('div', { class: 'mal-row' }, inp,
       h('button', {
         class: 'mal-btn ghost', text: 'Указать',
@@ -315,35 +363,34 @@
           const m = inp.value.match(/myanimelist\.net\/anime\/(\d+)/);
           if (m) choose(+m[1]); else inp.style.borderColor = 'red';
         },
-      }));
+      }),
+      h('button', { class: 'mal-btn ghost', text: 'Искать заново', onclick: () => { GM_deleteValue(candKey); render(); } }));
   }
 
-  async function renderCandidates() {
-    body.textContent = 'Ищу на MAL…';
-    let list = [];
-    try { list = await findCandidates(); } catch (e) { /* ignore */ }
+  function showCands(list) {
     list = list.map((a, i) => ({ a, i, s: scoreOf(a) })).sort((x, y) => y.s - x.s || x.i - y.i);
     body.textContent = '';
-    if (!list.length) body.append(h('div', { class: 'mal-msg', text: 'Ничего не нашлось автоматически — попробуйте «Поиск на MAL» или вставьте ссылку.' }));
+    if (!list.length) body.append(h('div', { class: 'mal-msg', text: 'Автоматически не нашлось — откройте «Поиск на MAL» и вставьте ссылку на нужную страницу.' }));
     list.forEach(({ a, s }, idx) => {
       const best = idx === 0 && s >= 3;
-      const y = a.year || (a.aired && a.aired.prop && a.aired.prop.from && a.aired.prop.from.year) || '?';
-      const eng = a.title_english && a.title_english !== a.title ? ' · ' + a.title_english : '';
+      const eng = a.eng && a.eng !== a.title ? ' · ' + a.eng : '';
       body.append(h('div', { class: 'mal-card' + (best ? ' best' : '') },
         h('div', null,
-          h('a', { href: a.url, target: '_blank', rel: 'noopener', text: a.title }),
-          h('div', { class: 'mal-meta', text: `${a.type || '?'} · ${y} · ${a.episodes != null ? a.episodes : '?'} эп. · ★${a.score != null ? a.score : '–'}${eng}${best ? ' · похоже на оно' : ''}` })),
-        h('button', { class: 'mal-btn', text: 'Это оно', onclick: () => choose(a.mal_id) })));
+          h('a', { href: 'https://myanimelist.net/anime/' + a.id, target: '_blank', rel: 'noopener', text: a.title }),
+          h('div', { class: 'mal-meta', text: `${(a.type || '?').toUpperCase()} · ${a.year || '?'} · ${a.eps ? a.eps : '?'} эп. · ★${a.score != null ? a.score : '–'}${eng}${best ? ' · похоже на оно' : ''}` })),
+        h('button', { class: 'mal-btn', text: 'Это оно', onclick: () => choose(a.id) })));
     });
     body.append(pasteRow());
   }
 
-  async function renderChosen(id) {
-    body.textContent = '';
-    const link = h('a', { href: 'https://myanimelist.net/anime/' + id, target: '_blank', rel: 'noopener', text: 'MAL #' + id });
-    body.append(h('div', { class: 'mal-row' }, link,
-      h('button', { class: 'mal-btn ghost', text: 'Сменить', onclick: () => { GM_deleteValue(mapKey); render(); } })));
-    jikanGet(JIKAN + '/' + id).then((a) => { if (a) link.textContent = a.title + ' (' + (a.type || '?') + ', ' + (a.episodes != null ? a.episodes : '?') + ' эп.)'; }).catch(() => {});
+  async function renderCandidates() {
+    const c = GM_getValue(candKey);
+    if (c && Date.now() - c.t < 12 * 3600 * 1000) { showCands(c.list); return; }
+    body.textContent = 'Ищу на MAL…';
+    let list = [];
+    try { list = await findCandidates(); } catch (e) { /* ignore */ }
+    if (list.length) GM_setValue(candKey, { t: Date.now(), list });
+    showCands(list);
   }
 
   /* ---------- отметка серий ---------- */
@@ -361,8 +408,115 @@
       .observe(items, { attributes: true, subtree: true, childList: true, attributeFilter: ['class'] });
   }
 
-  async function renderTracker(id) {
+  function buildTracker(id, data, state) {
+    const total = data.total || 0;
+    const ls = data.ls || {};
+    const detKey = 'det:' + id;
+
+    const statusSel = h('select', null, STATUSES.map(([v, t]) => h('option', { value: v, text: t })));
+    statusSel.value = ls.status || '';
+    const scoreSel = h('select', null, Array.from({ length: 11 }, (_, i) => h('option', { value: i, text: i === 0 ? '—' : i })));
+    scoreSel.value = ls.score || 0;
+    const watched = h('input', { type: 'number', min: '0', value: ls.num_episodes_watched || 0 });
+    const offset = h('input', { type: 'number', value: GM_getValue(offKey, 0) });
+    const msg = h('span', { class: 'mal-msg' });
+    const hint = h('div', { class: 'mal-msg' });
+    const markBtn = h('button', { class: 'mal-btn big' });
+    const det = h('details', null,
+      h('summary', { text: 'Нумерация не совпадает с MAL?' }),
+      h('div', { class: 'mal-row' },
+        'Сдвиг:', offset,
+        h('span', { class: 'mal-meta', text: 'Нужен, если на animevost серии идут подряд (13–24), а на MAL это 2-й part (1–12): тогда 12.' })),
+      hint);
+
+    const say = (t, ok) => { msg.className = 'mal-msg ' + (ok ? 'mal-ok' : 'mal-err'); msg.textContent = t; };
+
+    function normalize() {
+      let w = Math.max(0, parseInt(watched.value, 10) || 0);
+      if (total && w > total) w = total;
+      watched.value = w;
+      if (total && w >= total) statusSel.value = 'completed';
+      else if (w > 0 && ['', 'plan_to_watch', 'completed'].includes(statusSel.value)) statusSel.value = 'watching';
+    }
+
+    let chain = Promise.resolve();
+    function save() {
+      state.dirty = true;
+      chain = chain.then(async () => {
+        const b = {
+          status: statusSel.value || 'watching',
+          score: scoreSel.value,
+          num_watched_episodes: watched.value,
+        };
+        statusSel.value = b.status;
+        say('Сохраняю…', true);
+        try {
+          const r = await malApi('PATCH', '/anime/' + id + '/my_list_status', b);
+          data.ls = { status: r.status, score: r.score, num_episodes_watched: r.num_episodes_watched };
+          GM_setValue(detKey, data);
+          say('✓ Сохранено: ' + r.num_episodes_watched + (total ? '/' + total : '') + ' эп.', true);
+        } catch (e) { say(e.message, false); }
+      });
+    }
+    let timer;
+    const saveLater = () => { state.dirty = true; clearTimeout(timer); timer = setTimeout(save, 700); };
+
+    function updateMark() {
+      const n = currentEp();
+      const off = parseInt(offset.value, 10) || 0;
+      if (n == null) { markBtn.disabled = true; markBtn.textContent = 'Выберите серию в плеере'; return; }
+      markBtn.disabled = false;
+      markBtn.textContent = '✓ Серия ' + n + ' просмотрена' + (off ? ' (на MAL: ' + (n - off) + ')' : '');
+      if (total && n - off > total) {
+        hint.className = 'mal-msg mal-err';
+        hint.textContent = 'На MAL всего ' + total + ' эп., а у вас серия ' + (n - off) + ' — возможно, нужен сдвиг.';
+        det.open = true;
+      } else hint.textContent = '';
+    }
+
+    markBtn.addEventListener('click', () => {
+      const n = currentEp();
+      if (n == null) return;
+      const m = n - (parseInt(offset.value, 10) || 0);
+      if (m < 1) { say('Номер на MAL получился ' + m + ' — проверьте сдвиг.', false); det.open = true; return; }
+      if (total && m > total) { say('На MAL всего ' + total + ' эп. — проверьте сдвиг.', false); det.open = true; return; }
+      if (m < (parseInt(watched.value, 10) || 0) && !confirm('Это меньше текущего прогресса (' + watched.value + '). Уменьшить?')) return;
+      watched.value = m;
+      normalize();
+      clearTimeout(timer);
+      save();
+    });
+
+    statusSel.addEventListener('change', save);
+    scoreSel.addEventListener('change', save);
+    watched.addEventListener('change', () => { normalize(); saveLater(); });
+    offset.addEventListener('change', () => { GM_setValue(offKey, parseInt(offset.value, 10) || 0); updateMark(); });
+    epListeners.length = 0;
+    epListeners.push(updateMark);
+    updateMark();
+
+    const step = (d) => () => { watched.value = (parseInt(watched.value, 10) || 0) + d; normalize(); saveLater(); };
+
     track.textContent = '';
+    track.append(
+      h('div', { class: 'mal-row' }, markBtn, msg),
+      h('div', { class: 'mal-row' },
+        'Статус', statusSel, 'Оценка', scoreSel, 'Серий',
+        h('button', { class: 'mal-btn ghost', text: '−', onclick: step(-1) }),
+        watched,
+        h('button', { class: 'mal-btn ghost', text: '+', onclick: step(1) }),
+        total ? '/ ' + total : ''),
+      det);
+  }
+
+  async function renderChosen(id) {
+    body.textContent = '';
+    track.textContent = '';
+    const link = h('a', { href: 'https://myanimelist.net/anime/' + id, target: '_blank', rel: 'noopener', text: 'MAL #' + id });
+    body.append(h('div', { class: 'mal-row' }, link,
+      h('button', { class: 'mal-btn ghost', text: 'Сменить', onclick: () => { GM_deleteValue(mapKey); render(); } })));
+    const setTitle = (d) => { link.textContent = d.title + ' (' + (d.type || '?') + ', ' + (d.total ? d.total : '?') + ' эп.)'; };
+
     if (!GM_getValue('mal_client_id')) {
       track.append(h('div', { class: 'mal-row' }, 'Чтобы отмечать серии отсюда, подключите MAL: ',
         h('button', { class: 'mal-btn', text: 'Ввести Client ID', onclick: setupClientId })));
@@ -372,86 +526,33 @@
       track.append(h('div', { class: 'mal-row' }, h('button', { class: 'mal-btn', text: 'Войти в MAL', onclick: login })));
       return;
     }
-    track.append('Загружаю ваш список…');
-    let d;
+
+    const detKey = 'det:' + id;
+    const state = { dirty: false };
+    const cached = GM_getValue(detKey);
+    if (cached) { setTitle(cached); buildTracker(id, cached, state); }
+    else track.textContent = 'Загружаю ваш список…';
+
     try {
-      d = await malApi('GET', '/anime/' + id + '?fields=num_episodes,my_list_status');
+      const d = await malApi('GET', '/anime/' + id + '?fields=title,media_type,num_episodes,my_list_status');
+      const data = { title: d.title, type: (d.media_type || '').toUpperCase(), total: d.num_episodes || 0, ls: d.my_list_status || {} };
+      GM_setValue(detKey, data);
+      setTitle(data);
+      if (!state.dirty) buildTracker(id, data, state);
     } catch (e) {
-      track.textContent = '';
-      track.append(h('div', { class: 'mal-msg mal-err', text: e.message === 'not-auth' ? 'Нужно заново войти в MAL (меню Tampermonkey → MAL: войти).' : e.message }));
-      return;
+      if (!cached) {
+        track.textContent = '';
+        track.append(h('div', { class: 'mal-msg mal-err', text: e.message === 'not-auth' ? 'Нужно заново войти в MAL (меню Tampermonkey → MAL: войти).' : e.message }));
+      }
     }
-    const ls = d.my_list_status || {};
-    const total = d.num_episodes || 0;
-
-    const statusSel = h('select', null, STATUSES.map(([v, t]) => h('option', { value: v, text: t })));
-    statusSel.value = ls.status || '';
-    const scoreSel = h('select', null, Array.from({ length: 11 }, (_, i) => h('option', { value: i, text: i === 0 ? '—' : i })));
-    scoreSel.value = ls.score || 0;
-    const watched = h('input', { type: 'number', min: '0', value: ls.num_episodes_watched || 0 });
-    const offset = h('input', { type: 'number', value: GM_getValue(offKey, 0), title: 'Если на animevost нумерация сквозная (13–24), а на MAL part 2 (1–12): сдвиг 12' });
-    const msg = h('div', { class: 'mal-msg' });
-    const markBtn = h('button', { class: 'mal-btn' });
-
-    const say = (t, ok) => { msg.className = 'mal-msg ' + (ok ? 'mal-ok' : 'mal-err'); msg.textContent = t; };
-
-    async function save() {
-      const b = {
-        status: statusSel.value || 'watching',
-        score: scoreSel.value,
-        num_watched_episodes: watched.value,
-      };
-      statusSel.value = b.status;
-      try {
-        const r = await malApi('PATCH', '/anime/' + id + '/my_list_status', b);
-        say('Сохранено: ' + r.status + ', серий ' + r.num_episodes_watched + (total ? '/' + total : '') + ' ✓', true);
-      } catch (e) { say(e.message, false); }
-    }
-
-    function updateMark() {
-      const n = currentEp();
-      const off = parseInt(offset.value, 10) || 0;
-      if (n == null) { markBtn.disabled = true; markBtn.textContent = 'Выберите серию в плеере'; return; }
-      markBtn.disabled = false;
-      markBtn.textContent = '✓ Серия ' + n + ' просмотрена' + (off ? ' (MAL: ' + (n - off) + ')' : '');
-    }
-
-    markBtn.addEventListener('click', async () => {
-      const n = currentEp();
-      if (n == null) return;
-      const m = n - (parseInt(offset.value, 10) || 0);
-      if (m < 1) { say('Номер на MAL получился ' + m + ' — проверьте сдвиг.', false); return; }
-      if (total && m > total) { say('На MAL всего ' + total + ' эп. — проверьте сдвиг нумерации.', false); return; }
-      if (m < (parseInt(watched.value, 10) || 0) && !confirm('Это меньше текущего прогресса (' + watched.value + '). Уменьшить?')) return;
-      watched.value = m;
-      if (!statusSel.value || statusSel.value === 'plan_to_watch') statusSel.value = 'watching';
-      if (total && m >= total) statusSel.value = 'completed';
-      await save();
-    });
-    offset.addEventListener('change', () => { GM_setValue(offKey, parseInt(offset.value, 10) || 0); updateMark(); });
-    epListeners.length = 0;
-    epListeners.push(updateMark);
-    updateMark();
-
-    track.textContent = '';
-    track.append(
-      h('div', { class: 'mal-row' }, markBtn),
-      h('div', { class: 'mal-row' },
-        'Статус', statusSel, 'Оценка', scoreSel, 'Серий',
-        h('button', { class: 'mal-btn ghost', text: '−', onclick: () => { watched.value = Math.max(0, (+watched.value || 0) - 1); } }),
-        watched,
-        h('button', { class: 'mal-btn ghost', text: '+', onclick: () => { watched.value = (+watched.value || 0) + 1; } }),
-        total ? '/ ' + total : '',
-        h('button', { class: 'mal-btn', text: 'Сохранить', onclick: save }),
-        'Сдвиг', offset),
-      msg);
   }
 
   /* ---------- запуск ---------- */
   function render() {
+    epListeners.length = 0;
     track.textContent = '';
     const id = GM_getValue(mapKey);
-    if (id) { renderChosen(id); renderTracker(id); } else { renderCandidates(); }
+    if (id) renderChosen(id); else renderCandidates();
   }
   render();
 })();
