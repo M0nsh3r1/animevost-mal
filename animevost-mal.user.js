@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Animevost → MyAnimeList
 // @namespace    animevost-mal
-// @version      1.0
+// @version      1.1
 // @description  Находит аниме на MAL по названию с animevost, показывает карточки-кандидаты и даёт отмечать серии прямо на странице
 // @match        https://animevost.org/*
 // @run-at       document-idle
@@ -59,6 +59,16 @@
     if (v !== null) { GM_setValue('mal_client_id', v.trim()); location.reload(); }
   }
 
+  function setupSecret() {
+    const v = prompt('Client Secret приложения MAL (оставьте пустым, если тип приложения "other"):', GM_getValue('mal_client_secret', ''));
+    if (v !== null) { GM_setValue('mal_client_secret', v.trim()); alert('Сохранено. Теперь нажмите «Войти в MAL» ещё раз.'); }
+  }
+
+  function clientAuth() {
+    const s = GM_getValue('mal_client_secret', '');
+    return s ? { client_secret: s } : {};
+  }
+
   function login() {
     const cid = GM_getValue('mal_client_id', '');
     if (!cid) { setupClientId(); return; }
@@ -97,13 +107,13 @@
         method: 'POST',
         url: TOKEN_URL,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        data: form({
+        data: form(Object.assign({
           client_id: GM_getValue('mal_client_id', ''),
           grant_type: 'authorization_code',
           code: p.get('code'),
           code_verifier: saved.verifier,
           redirect_uri: REDIRECT,
-        }),
+        }, clientAuth())),
       });
       if (r.status !== 200) throw new Error('token ' + r.status + ' ' + r.responseText);
       saveTok(JSON.parse(r.responseText));
@@ -118,6 +128,7 @@
   if (location.pathname === '/mal-auth') { handleCallback(); return; }
 
   GM_registerMenuCommand('MAL: ввести Client ID', setupClientId);
+  GM_registerMenuCommand('MAL: ввести Client Secret', setupSecret);
   GM_registerMenuCommand('MAL: войти', login);
   GM_registerMenuCommand('MAL: выйти', () => { GM_deleteValue('mal_tok'); location.reload(); });
 
@@ -128,11 +139,11 @@
       method: 'POST',
       url: TOKEN_URL,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      data: form({
+      data: form(Object.assign({
         client_id: GM_getValue('mal_client_id', ''),
         grant_type: 'refresh_token',
         refresh_token: t.refresh_token,
-      }),
+      }, clientAuth())),
     });
     if (r.status !== 200) { GM_deleteValue('mal_tok'); throw new Error('not-auth'); }
     saveTok(JSON.parse(r.responseText));
