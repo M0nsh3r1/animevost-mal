@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Animevost → MyAnimeList
 // @namespace    animevost-mal
-// @version      1.1
+// @version      1.2
 // @description  Находит аниме на MAL по названию с animevost, показывает карточки-кандидаты и даёт отмечать серии прямо на странице
 // @match        https://animevost.org/*
 // @run-at       document-idle
@@ -69,6 +69,21 @@
     return s ? { client_secret: s } : {};
   }
 
+  // Для приложений типа web отправляем секрет и в теле, и в заголовке Basic
+  function tokHeaders() {
+    const hd = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    const s = GM_getValue('mal_client_secret', '');
+    if (s) hd.Authorization = 'Basic ' + btoa(GM_getValue('mal_client_id', '') + ':' + s);
+    return hd;
+  }
+
+  function diag() {
+    const id = GM_getValue('mal_client_id', '');
+    const s = GM_getValue('mal_client_secret', '');
+    return ' [client_id: ' + (id ? id.slice(0, 4) + '…' + id.slice(-4) + ' (' + id.length + ' симв.)' : 'нет')
+      + '; secret: ' + (s ? 'задан (' + s.length + ' симв.)' : 'НЕ задан') + ']';
+  }
+
   function login() {
     const cid = GM_getValue('mal_client_id', '');
     if (!cid) { setupClientId(); return; }
@@ -106,7 +121,7 @@
       const r = await gm({
         method: 'POST',
         url: TOKEN_URL,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: tokHeaders(),
         data: form(Object.assign({
           client_id: GM_getValue('mal_client_id', ''),
           grant_type: 'authorization_code',
@@ -115,7 +130,7 @@
           redirect_uri: REDIRECT,
         }, clientAuth())),
       });
-      if (r.status !== 200) throw new Error('token ' + r.status + ' ' + r.responseText);
+      if (r.status !== 200) throw new Error('token ' + r.status + ' ' + r.responseText + diag());
       saveTok(JSON.parse(r.responseText));
       GM_deleteValue('mal_pkce');
       msg.textContent = 'Готово, возвращаю на страницу…';
@@ -138,7 +153,7 @@
     const r = await gm({
       method: 'POST',
       url: TOKEN_URL,
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: tokHeaders(),
       data: form(Object.assign({
         client_id: GM_getValue('mal_client_id', ''),
         grant_type: 'refresh_token',
